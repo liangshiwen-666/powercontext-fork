@@ -1015,6 +1015,73 @@ MEMORY_ENTRY_HEADS_TABLE = Table(
 
 MEMORY_TABLES = (MEMORY_ENTRY_VERSIONS_TABLE, MEMORY_ENTRY_HEADS_TABLE)
 
+
+MAX_SOURCE_LIFECYCLE_NODE_ID_LENGTH = 128
+
+
+# One registered evidence-dependency node per Scope. A Source node carries the
+# caller-declared lifecycle revision; Memory and Topic nodes carry exactly one
+# native binding plus the all/any policy that derives their availability.
+SOURCE_LIFECYCLE_NODES_TABLE = Table(
+    "pc_source_lifecycle_nodes",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_LIFECYCLE_NODE_ID_LENGTH), primary_key=True),
+    Column("ordinal", Integer, nullable=False),
+    Column("kind", identity_string(16), nullable=False),
+    Column("policy", identity_string(8)),
+    Column("parents", _canonical_payload_type(), nullable=False),
+    Column("available", Boolean, nullable=False),
+    Column("revision", Integer),
+    Column("source_type", identity_string(MAX_SOURCE_TYPE_LENGTH)),
+    Column("source_id", identity_string(MAX_SOURCE_ID_LENGTH)),
+    Column("memory_artifact_id", identity_string(MAX_ARTIFACT_ID_LENGTH)),
+    Column("memory_revision", Integer),
+    Column("entry_id", identity_string(MAX_MEMORY_ENTRY_ID_LENGTH)),
+    Column("entry_version_id", identity_string(MAX_MEMORY_ENTRY_ID_LENGTH)),
+    Column("topic_artifact_id", identity_string(MAX_ARTIFACT_ID_LENGTH)),
+    Column("topic_revision", Integer),
+    UniqueConstraint("scope_id", "ordinal", name="uq_pc_source_lifecycle_nodes_ordinal"),
+    CheckConstraint("ordinal >= 0", name="ck_pc_source_lifecycle_nodes_ordinal_nonnegative"),
+    CheckConstraint(
+        "kind IN ('source', 'memory', 'topic')",
+        name="ck_pc_source_lifecycle_nodes_kind",
+    ),
+    CheckConstraint(
+        "policy IS NULL OR policy IN ('all', 'any')",
+        name="ck_pc_source_lifecycle_nodes_policy",
+    ),
+    CheckConstraint(
+        "(kind = 'source' AND policy IS NULL AND revision > 0 "
+        "AND source_type IS NOT NULL AND source_id IS NOT NULL) "
+        "OR (kind = 'memory' AND policy IS NOT NULL AND revision IS NULL "
+        "AND memory_artifact_id IS NOT NULL AND memory_revision > 0 "
+        "AND entry_id IS NOT NULL AND entry_version_id IS NOT NULL) "
+        "OR (kind = 'topic' AND policy IS NOT NULL AND revision IS NULL "
+        "AND topic_artifact_id IS NOT NULL AND topic_revision > 0)",
+        name="ck_pc_source_lifecycle_nodes_binding",
+    ),
+)
+
+
+SOURCE_LIFECYCLE_EVENTS_TABLE = Table(
+    "pc_source_lifecycle_events",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_LIFECYCLE_NODE_ID_LENGTH), primary_key=True),
+    Column("sequence", BigInteger, primary_key=True),
+    Column("revision", Integer, nullable=False),
+    Column("available", Boolean, nullable=False),
+    Column("reason", _entry_text_type(), nullable=False),
+    # False only while a propagation still has to reach the native families, so a
+    # retry of the same event can finish it and a successful replay stays inert.
+    Column("propagated", Boolean, nullable=False, server_default="0"),
+    CheckConstraint("sequence > 0", name="ck_pc_source_lifecycle_events_sequence_positive"),
+    CheckConstraint("revision > 0", name="ck_pc_source_lifecycle_events_revision_positive"),
+)
+
+SOURCE_LIFECYCLE_TABLES = (SOURCE_LIFECYCLE_NODES_TABLE, SOURCE_LIFECYCLE_EVENTS_TABLE)
+
 TOPIC_MEMORY_TABLES = (
     TOPIC_MEMORY_RETRIEVAL_SHAPE_TABLE,
     TOPIC_MEMORY_REVISION_PUBLICATIONS_TABLE,
@@ -1185,6 +1252,7 @@ BUILTIN_TABLES = (
     + SHARED_TABLES
     + TOPIC_MEMORY_TABLES
     + MEMORY_TABLES
+    + SOURCE_LIFECYCLE_TABLES
     + STATISTICS_TABLES
     + RECURRENCE_TABLES
     + (ARTIFACT_TAGS_TABLE, DREAM_RUNS_TABLE, RECEIPT_MIGRATION_REVIEW_TABLE)
