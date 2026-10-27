@@ -47,6 +47,7 @@ else:
     from multiprocessing.popen_spawn_posix import Popen as SpawnPopen
 
 from powercontext._logging import log_safely
+from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.errors import ArtifactProcessingLeadershipLostError
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
@@ -57,7 +58,11 @@ from powercontext.builtin.persistence.supervision import (
     ArtifactProcessingLeaseRepository,
     database_utc_now,
 )
-from powercontext.builtin.persistence.tables import ARTIFACT_PROCESSING_INTENTS_TABLE, ARTIFACT_PROCESSING_LEASES_TABLE
+from powercontext.builtin.persistence.tables import (
+    ARTIFACT_PROCESSING_INTENTS_TABLE,
+    ARTIFACT_PROCESSING_LEASES_TABLE,
+    SOURCE_JOURNAL_HEADS_TABLE,
+)
 from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkAssignment,
     ArtifactProcessingWorkerCompletion,
@@ -80,6 +85,9 @@ _RETRY_STATE_LIMIT = 1000
 _CHANNEL_QUEUE_LIMIT = _DISCOVERY_PAGE_SIZE // 2
 _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
 _DISCOVERY_TIMEOUT_SECONDS = 2.0
+# Count admission is observed from persisted journal metadata, so the Supervisor polls it
+# instead of relying on a capture-side wake-up.
+_COUNT_DISCOVERY_INTERVAL_SECONDS = 0.2
 _SPAWN_SIGTERM_GRACE_SECONDS = 1.0
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 ProcessingKey = tuple[str, str]
@@ -114,6 +122,10 @@ class ArtifactProcessingBinding:
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
     pending_provider: ArtifactProcessingPendingProvider | None = None
+    # Automatic admission also fires once this many persisted Source journal
+    # entries remain after the processor's last successful cursor. None keeps
+    # the legacy time-only trigger; an explicit request always bypasses it.
+    source_count_threshold: int | None = None
     # Only automatic admission is filtered; already accepted requests retain
     # their own Worker authorization and domain completion semantics.
     automatic_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
@@ -131,6 +143,10 @@ class ArtifactProcessingBinding:
             raise ValueError("max_workers must be a positive integer")  # noqa: TRY003
         if self.worker_timeout_seconds <= 0:
             raise ValueError("worker_timeout_seconds must be positive")  # noqa: TRY003
+        if self.source_count_threshold is not None and (
+            type(self.source_count_threshold) is not int or self.source_count_threshold < 1
+        ):
+            raise ValueError("source_count_threshold must be a positive integer")  # noqa: TRY003
         if self.automatic_processing_interval is not None:
             if self.automatic_processing_interval.total_seconds() <= 0:
                 raise ValueError("automatic interval must be positive")  # noqa: TRY003
@@ -399,6 +415,8 @@ class _FamilyState:
     reconcile_complete: bool = False
     notification_at_start: int = 0
     discovery_pending: bool = True
+    count_after: str | None = None
+    next_count_check_at: float = 0.0
     next_schedule_at: float | None = None
     next_discovery_at: float = 0.0
     automatic_next: bool = False
@@ -585,6 +603,8 @@ class ArtifactProcessingSupervisor:
             state.discovery_pending = True
             state.reconcile_complete = False
             state.reconcile_after = None
+            state.count_after = None
+            state.next_count_check_at = 0.0
         if self._lease_mode == "oceanbase":
             self._renew_task = asyncio.create_task(self._renew(), name=f"artifact-lease-{self._supervisor_group}")
 
@@ -633,8 +653,80 @@ class ArtifactProcessingSupervisor:
                     self._log_failure(state, None, error, "scope_discovery")
                 finally:
                     state.discovery_seconds = asyncio.get_running_loop().time() - now
+            await self._discover_count_if_due(state)
             await self._activate_retries(state)
             await self._dispatch(state)
+
+    async def _discover_count_if_due(self, state: _FamilyState) -> None:
+        """Accept automatic work when a Scope has enough pending journal entries."""
+        binding = state.binding
+        threshold = binding.source_count_threshold
+        if threshold is None or len(state.running) >= binding.max_workers:
+            return
+        loop = asyncio.get_running_loop()
+        if loop.time() < state.next_count_check_at:
+            return
+        if loop.time() < state.overflow_not_before:
+            # The bounded retry cache asked for a pause on new admission.
+            state.next_count_check_at = state.overflow_not_before
+            return
+        try:
+            async with asyncio.timeout(_DISCOVERY_TIMEOUT_SECONDS):
+                await self._discover_count(state, threshold)
+            state.degraded = False
+        except ArtifactProcessingLeadershipLostError:
+            raise
+        except Exception as error:
+            state.degraded = True
+            state.next_count_check_at = loop.time() + self._tick
+            self._log_failure(state, None, error, "count_discovery")
+
+    async def _discover_count(self, state: _FamilyState, threshold: int) -> None:
+        binding = state.binding
+        capacity = self._fresh_capacity(state)
+        if capacity <= 0:
+            state.next_count_check_at = asyncio.get_running_loop().time() + _COUNT_DISCOVERY_INTERVAL_SECONDS
+            return
+        page_limit = min(capacity, _DISCOVERY_PAGE_SIZE)
+        after = state.count_after
+        next_after = after
+        admitted: list[str] = []
+        async with self._database.transaction() as connection:
+            await self._leases.require_fence(connection, self._require_current_fence())
+            heads = SOURCE_JOURNAL_HEADS_TABLE
+            statement = select(heads.c.scope_id, heads.c.position).where(heads.c.position > 0)
+            if after is not None:
+                statement = statement.where(heads.c.scope_id > after)
+            rows = (await connection.execute(statement.order_by(heads.c.scope_id).limit(page_limit))).all()
+            cursors = await SourceCursorRepository().load_many(
+                connection, [str(row[0]) for row in rows], binding.binding_name
+            )
+            intents = ArtifactProcessingIntentRepository()
+            for scope_id, high in rows:
+                scope = str(scope_id)
+                next_after = scope
+                if scope in state.queued or scope in state.running or scope in state.retries:
+                    continue
+                stored = cursors.get(scope)
+                consumed = 0 if stored is None else stored.cursor.sequence
+                if int(high) - consumed < threshold:
+                    continue
+                # Only one accepted call at a time; a later check re-evaluates
+                # the remaining count against the successor cursor.
+                intent = await intents.load(connection, scope, binding.binding_name, for_update=True)
+                if intent is None or intent.requested_generation != intent.handled_generation:
+                    continue
+                await intents.request(connection, scope, binding.binding_name)
+                admitted.append(scope)
+        loop = asyncio.get_running_loop()
+        if len(rows) == page_limit:
+            state.count_after = next_after
+            state.next_count_check_at = loop.time() + _DISCOVERY_PAGE_DELAY_SECONDS
+        else:
+            state.count_after = None
+            state.next_count_check_at = loop.time() + _COUNT_DISCOVERY_INTERVAL_SECONDS
+        for scope in admitted:
+            self._enqueue(state, scope)
 
     async def _discover(self, state: _FamilyState) -> None:
         binding = state.binding
@@ -1060,6 +1152,8 @@ class ArtifactProcessingSupervisor:
             state.requested_after = state.scan_after = state.scan_generation = 0
             state.scan_in_progress = False
             state.discovery_pending = True
+            state.count_after = None
+            state.next_count_check_at = 0.0
 
     async def _reap_unconfirmed_exits(self) -> None:
         for handle in tuple(self._unreaped):
@@ -1093,6 +1187,8 @@ class ArtifactProcessingSupervisor:
                 continue
             if state.next_schedule_at is not None:
                 deadlines.append(state.next_schedule_at)
+            if state.binding.source_count_threshold is not None:
+                deadlines.append(state.next_count_check_at)
             if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:
                 deadlines.append(max(now, state.next_discovery_at))
         return None if not deadlines else max(0.001, min(deadlines) - now)

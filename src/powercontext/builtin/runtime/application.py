@@ -847,6 +847,34 @@ class ScopedContextApplication:
                 await authorize_scopes((self.scope_id, *scope.context_references))
             return await self._prepare(request, scope)
 
+    async def prepare_incremental(
+        self,
+        request: PrepareContextRequest,
+        base_pack: "ContextPack | None" = None,
+    ) -> "ContextPack | ContextPackDelta":
+        """Build the full context pack, or a delta against ``base_pack``, for one request."""
+
+        from powercontext.builtin.runtime.context_pack import (
+            ContextPack,
+            ContextPackDelta,
+            ContextPackError,
+            pack_against_base,
+        )
+
+        prepared = await self.prepare(request)
+        content = "" if prepared.content is None else prepared.content
+        if base_pack is None:
+            return ContextPack.from_content(content)
+        if not isinstance(base_pack, ContextPack):
+            raise ContextPackError("base_pack must be a ContextPack")
+        target, reused = pack_against_base(base_pack, content)
+        return ContextPackDelta(
+            base_digest=base_pack.digest,
+            target_digest=target.digest,
+            prefix_items=reused,
+            appended=target.items[reused:],
+        )
+
     async def _prepare(self, request: PrepareContextRequest, scope: ScopeDescriptor, /) -> PreparedContext:
         build, effort = await self._prepare_build(request, scope)
         if effort is not None and self._runtime._recall_effort_sink is not None:
