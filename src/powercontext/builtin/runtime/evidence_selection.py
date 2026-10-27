@@ -89,8 +89,11 @@ _ABBREVIATIONS = frozenset({
 # BM25 term saturation and length normalization.
 _K1 = 1.2
 _B = 0.75
-# A title/lead sentence is rarely itself cited evidence, and fragment-like captions are noisy.
-_FIRST_SENTENCE_WEIGHT = 0.8
+# A lead sentence is almost never itself cited evidence: it is usually the document title, or an
+# abstract's background line. Leaving it at zero stops it from competing for a cited fragment; it
+# is still quoted for free when a multi-sentence window or the adjacent-fill pass carries it into
+# an already selected block.
+_FIRST_SENTENCE_WEIGHT = 0.0
 _SHORT_SENTENCE_TOKENS = 3
 _SHORT_SENTENCE_WEIGHT = 0.75
 # Adjacent query words appearing adjacently in a span are much stronger evidence than a bag match.
@@ -98,6 +101,13 @@ _PHRASE_BONUS_WEIGHT = 0.6
 # A sentence matching more of the query's weighted terms is likelier to be the evidence sentence
 # even when every single term is common in the candidate set (a paper repeats its own topic words).
 _COVERAGE_WEIGHT = 0.6
+# Contiguous multi-sentence windows are selection candidates too: one cited fragment covering an
+# adjacent evidence block is cheaper than two fragments and survives a budget that cannot hold both
+# sentences separately. ``_WINDOW_MAX_SIZE <= 1`` disables them.
+_WINDOW_MAX_SIZE = 2
+_WINDOW_NEIGHBOR_RATIO = 0.0
+_WINDOW_SCORE_DISCOUNT = 0.75
+_WINDOW_MAX_CONTENT_BYTES = 900
 _MAX_SPANS = 8
 
 
@@ -119,8 +129,10 @@ class _Sentence:
 
 @dataclass(frozen=True)
 class _Unit:
+    """One selectable sentence group: a single sentence or a contiguous adjacent window."""
+
     candidate_index: int
-    sentence_index: int
+    sentence_indices: tuple[int, ...]
     score: float
 
 
@@ -178,16 +190,22 @@ def select_evidence_spans(
     """
 
     sentences = tuple(_sentences(text) for text in texts)
-    units = _rank_units(query, sentences)
+    units = _selectable_units(query, sentences)
+    sentence_scores = {
+        (unit.candidate_index, unit.sentence_indices[0]): unit.score
+        for unit in units
+        if len(unit.sentence_indices) == 1
+    }
     chosen: set[tuple[int, int]] = set()
 
     def spans_for(chosen_sentences: set[tuple[int, int]]) -> tuple[EvidenceSpan, ...]:
         return _merge_spans(chosen_sentences, sentences)
 
-    def try_add(candidate_index: int, sentence_index: int) -> bool:
-        if (candidate_index, sentence_index) in chosen:
+    def try_add(candidate_index: int, sentence_indices: Sequence[int]) -> bool:
+        indices = {(candidate_index, sentence_index) for sentence_index in sentence_indices}
+        if indices <= chosen:
             return False
-        trial = chosen | {(candidate_index, sentence_index)}
+        trial = chosen | indices
         trial_spans = spans_for(trial)
         if len(trial_spans) > max_spans:
             return False
@@ -197,13 +215,13 @@ def select_evidence_spans(
         chosen.update(trial)
         return True
 
-    # Seed with every sentence the query actually matches, best first: a matched sentence is a
-    # far better candidate than any unmatched one, whether it starts a new fragment or extends one.
+    # Seed with every group the query actually matches, best first: a matched group is a far better
+    # candidate than any unmatched one, whether it starts a new fragment or extends an existing one.
     for unit in units:
         if unit.score > 0.0:
-            try_add(unit.candidate_index, unit.sentence_index)
+            try_add(unit.candidate_index, unit.sentence_indices)
 
-    _fill_spare_budget(chosen, units, sentences, try_add)
+    _fill_spare_budget(chosen, sentence_scores, sentences, try_add)
 
     return spans_for(chosen)
 
@@ -250,7 +268,7 @@ def _rank_units(query: str, sentences: Sequence[Sequence[_Sentence]]) -> tuple[_
     unit_tokens: list[tuple[str, ...]] = []
     for candidate_index, candidate_sentences in enumerate(sentences):
         for sentence_index, sentence in enumerate(candidate_sentences):
-            units.append(_Unit(candidate_index=candidate_index, sentence_index=sentence_index, score=0.0))
+            units.append(_Unit(candidate_index=candidate_index, sentence_indices=(sentence_index,), score=0.0))
             unit_tokens.append(sentence.tokens)
     query_tokens = _tokens(query)
     if not units or not query_tokens:
@@ -292,13 +310,57 @@ def _rank_units(query: str, sentences: Sequence[Sequence[_Sentence]]) -> tuple[_
                 score += weight
         if total_weight > 0.0:
             score *= 1.0 + _COVERAGE_WEIGHT * matched_weight / total_weight
-        if unit.sentence_index == 0:
+        if unit.sentence_indices[0] == 0:
             score *= _FIRST_SENTENCE_WEIGHT
         if length <= _SHORT_SENTENCE_TOKENS:
             score *= _SHORT_SENTENCE_WEIGHT
-        ranked.append(_Unit(unit.candidate_index, unit.sentence_index, score))
-    ranked.sort(key=lambda unit: (-unit.score, unit.candidate_index, unit.sentence_index))
+        ranked.append(_Unit(unit.candidate_index, unit.sentence_indices, score))
+    ranked.sort(key=lambda unit: (-unit.score, unit.candidate_index, unit.sentence_indices))
     return tuple(ranked)
+
+
+def _selectable_units(query: str, sentences: Sequence[Sequence[_Sentence]]) -> tuple[_Unit, ...]:
+    """Rank single sentences and add contiguous multi-sentence window candidates.
+
+    A window inherits the summed score of its sentences (slightly discounted) so a multi-sentence
+    evidence block is considered before its individual sentences; when a window is selected both
+    sentences become one merged fragment, which costs one citation instead of two and fits budgets
+    that cannot hold them as separate fragments.
+    """
+
+    ranked = _rank_units(query, sentences)
+    if _WINDOW_MAX_SIZE <= 1 or not ranked:
+        return ranked
+    scores = {
+        (unit.candidate_index, unit.sentence_indices[0]): unit.score
+        for unit in ranked
+        if len(unit.sentence_indices) == 1
+    }
+    best_score = max(scores.values(), default=0.0)
+    units: list[_Unit] = list(ranked)
+    for candidate_index, candidate_sentences in enumerate(sentences):
+        for size in range(2, _WINDOW_MAX_SIZE + 1):
+            for start in range(len(candidate_sentences) - size + 1):
+                indices = tuple(range(start, start + size))
+                sentence_scores = [scores[(candidate_index, sentence_index)] for sentence_index in indices]
+                if min(sentence_scores) <= 0.0:
+                    continue
+                if best_score > 0.0 and min(sentence_scores) < _WINDOW_NEIGHBOR_RATIO * best_score:
+                    continue
+                content_bytes = (
+                    candidate_sentences[indices[-1]].end - candidate_sentences[indices[0]].start
+                )
+                if content_bytes > _WINDOW_MAX_CONTENT_BYTES:
+                    continue
+                units.append(
+                    _Unit(
+                        candidate_index=candidate_index,
+                        sentence_indices=indices,
+                        score=sum(sentence_scores) * _WINDOW_SCORE_DISCOUNT,
+                    )
+                )
+    units.sort(key=lambda unit: (-unit.score, unit.candidate_index, unit.sentence_indices))
+    return tuple(units)
 
 
 def _term_counts(tokens: Sequence[str], terms: dict[str, frozenset[str]]) -> dict[str, int]:
@@ -376,9 +438,9 @@ def _merge_spans(
 
 def _fill_spare_budget(
     chosen: set[tuple[int, int]],
-    units: Sequence[_Unit],
+    sentence_scores: dict[tuple[int, int], float],
     sentences: Sequence[Sequence[_Sentence]],
-    try_add: Callable[[int, int], bool],
+    try_add: Callable[[int, Sequence[int]], bool],
 ) -> None:
     """Spend leftover bytes on sentences adjacent to an already selected one.
 
@@ -391,9 +453,8 @@ def _fill_spare_budget(
         for candidate_index, candidate_sentences in enumerate(sentences):
             if not candidate_sentences:
                 continue
-            if try_add(candidate_index, 0):
+            if try_add(candidate_index, (0,)):
                 break
-    scores = {(unit.candidate_index, unit.sentence_index): unit.score for unit in units}
     while True:
         neighbors: list[tuple[float, int, int, int]] = []
         for candidate_index, sentence_index in chosen:
@@ -406,14 +467,19 @@ def _fill_spare_budget(
                 # that matched the query most strongly.
                 forward_rank = 0 if direction == 1 else 1
                 neighbors.append(
-                    (scores.get((candidate_index, adjacent), 0.0), candidate_index, forward_rank, adjacent)
+                    (
+                        sentence_scores.get((candidate_index, adjacent), 0.0),
+                        candidate_index,
+                        forward_rank,
+                        adjacent,
+                    )
                 )
         if not neighbors:
             return
         neighbors.sort(key=lambda entry: (-entry[0], entry[1], entry[2], entry[3]))
         progressed = False
         for _, candidate_index, _, adjacent in neighbors:
-            if try_add(candidate_index, adjacent):
+            if try_add(candidate_index, (adjacent,)):
                 progressed = True
                 break
         if not progressed:
